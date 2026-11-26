@@ -1,46 +1,53 @@
 <p align="center">
   <img src="https://img.shields.io/badge/LANGUAGE-Zig-F7A41D?style=for-the-badge&logo=zig" alt="Lang">
   <img src="https://img.shields.io/badge/FALSE--SHARING-PROTECTED-FFFFFF?style=for-the-badge" alt="Cache">
-  <img src="https://img.shields.io/badge/ORDERING-Acquire%2FRelease-333333?style=for-the-badge" alt="Order">
+  <img src="https://img.shields.io/badge/ZERO--COPY-FRAMED-333333?style=for-the-badge" alt="ZeroCopy">
 </p>
 
 # spsc-ring
 
-**Cache-line aware lock-free SPSC ring buffer + arena allocator** in pure Zig.
+**Low-latency lock-free SPSC ring** with framed zero-copy messages and hybrid waiting.
 
-## Hardcore features
+## Features
 
-- **False-sharing protection** — `head` and `tail` live on separate cache lines (`align(std.atomic.cache_line)`).
-- **Cached indexes** — producer and consumer keep local copies of the opposite index and only reload the atomic when the buffer looks full/empty. Typical 2–4× speedup.
-- **Strict Acquire/Release** — data is written *before* the release store of the index; data is read *after* the acquire load. Correct on ARM64 and x86.
-- **Bulk operations** — `pushSlice` / `popSlice` move many elements with a single index update.
-- **Arena** — bump allocator with `reset()` that keeps the underlying memory, plus poison fill in Debug builds to catch use-after-free.
+- **Cache-line isolation** — `head` / `tail` on separate lines
+- **Local index caching** — 2–4× less atomic traffic
+- **Acquire / Release** only
+- **Fixed-size API** — `push` / `pop` / `pushSlice` / `popSlice`
+- **Framed variable-length API** — `reserve(len) → []u8` + `commit(len)` (zero-copy)
+- **Hybrid wait** — short `spinLoopHint` then `std.Thread.Futex`
+- **Arena** with `reset()` + Debug poison
 
-## Quick example
+## Example (framed zero-copy)
 
 ```zig
-var rb = RingBuffer(u64, 1024).init();
-_ = rb.push(42);
-_ = rb.pushSlice(&[_]u64{ 1, 2, 3 });
-const v = rb.pop();
-```
-
-## Build & test
-
-```bash
-zig build test
-zig build
+var fr = FramedRing(4096).init();
+if (fr.reserve(5)) |buf| {
+    @memcpy(buf, "hello");
+    fr.commit(5);
+}
+if (fr.read()) |msg| {
+    // msg is a direct slice into the ring — no copy
+    fr.advance(msg.len);
+}
 ```
 
 ## Guarantees
 
 | Property              | Guarantee                                      |
 |-----------------------|------------------------------------------------|
-| False sharing         | Separated by full cache line                   |
-| Memory ordering       | Acquire / Release only (no SeqCst tax)         |
-| Progress              | Wait-free on the uncontended path              |
-| Arena safety (Debug)  | Poison on free / reset                         |
+| False sharing         | Full cache-line separation                     |
+| Ordering              | Acquire / Release                              |
+| Variable messages     | Framed + zero-copy reserve/commit              |
+| Waiting               | Spin → Futex (no 100 % CPU burn)               |
 | Dependencies          | Only Zig std                                   |
+
+## Build
+
+```bash
+zig build test
+zig build
+```
 
 ## License
 
