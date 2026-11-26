@@ -3,10 +3,9 @@ const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 const cache_line = std.atomic.cache_line;
 
-/// Cache-line aware lock-free SPSC ring.
 pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
-    comptime {
-        if (!std.math.isPowerOfTwo(capacity)) @compileError("capacity must be power of two");
+    if (!std.math.isPowerOfTwo(capacity)) {
+        @compileError("capacity must be a power of two");
     }
     return struct {
         const Self = @This();
@@ -20,9 +19,10 @@ pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
         buffer: [capacity]T = undefined,
         cached_tail: usize = 0,
         cached_head: usize = 0,
-        head_futex: Atomic(u32) = Atomic(u32).init(0),
 
-        pub fn init() Self { return .{}; }
+        pub fn init() Self {
+            return .{};
+        }
 
         pub fn push(self: *Self, value: T) bool {
             const head = self.head.load(.unordered);
@@ -33,7 +33,6 @@ pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
             }
             self.buffer[head] = value;
             self.head.store(next, .release);
-            _ = self.head_futex.fetchAdd(1, .release);
             return true;
         }
 
@@ -52,9 +51,9 @@ pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
                 self.cached_head = self.head.load(.acquire);
                 if (tail == self.cached_head) return null;
             }
-            const v = self.buffer[tail];
+            const value = self.buffer[tail];
             self.tail.store((tail + 1) & mask, .release);
-            return v;
+            return value;
         }
 
         pub fn popSlice(self: *Self, out: []T) usize {
@@ -68,33 +67,17 @@ pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
             return n;
         }
 
-        /// Hybrid wait: short spin then futex.
-        pub fn popWait(self: *Self, spin_iters: usize) T {
-            var i: usize = 0;
-            while (true) {
-                if (self.pop()) |v| return v;
-                if (i < spin_iters) {
-                    std.atomic.spinLoopHint();
-                    i += 1;
-                } else {
-                    const expected = self.head_futex.load(.acquire);
-                    if (self.pop()) |v| return v;
-                    std.Thread.Futex.wait(&self.head_futex, expected);
-                    i = 0;
-                }
-            }
-        }
-
         pub fn len(self: *const Self) usize {
-            return (self.head.load(.unordered) -% self.tail.load(.unordered)) & mask;
+            const h = self.head.load(.unordered);
+            const t = self.tail.load(.unordered);
+            return (h -% t) & mask;
         }
     };
 }
 
-/// Variable-length framed ring (zero-copy reserve/commit).
 pub fn FramedRing(comptime capacity: usize) type {
-    comptime {
-        if (!std.math.isPowerOfTwo(capacity)) @compileError("capacity must be power of two");
+    if (!std.math.isPowerOfTwo(capacity)) {
+        @compileError("capacity must be a power of two");
     }
     return struct {
         const Self = @This();
@@ -106,20 +89,20 @@ pub fn FramedRing(comptime capacity: usize) type {
         _pad2: [cache_line - @sizeOf(Atomic(usize))]u8 = undefined,
         buffer: [capacity]u8 = undefined,
 
-        pub fn init() Self { return .{}; }
+        pub fn init() Self {
+            return .{};
+        }
 
-        /// Reserve contiguous space for a message of `len` bytes.
-        /// Returns a writable slice inside the ring or null.
         pub fn reserve(self: *Self, len: usize) ?[]u8 {
             const total = 4 + len;
             const head = self.head.load(.unordered);
             const tail = self.tail.load(.acquire);
             const used = (head -% tail) & mask;
             if (used + total >= capacity) return null;
-            if (head + total > capacity) return null; // require contiguous
+            if (head + total > capacity) return null;
 
-            const len_ptr: *u32 = @ptrCast(@alignCast(&self.buffer[head]));
-            len_ptr.* = @intCast(len);
+            const len_bytes = std.mem.asBytes(&@as(u32, @intCast(len)));
+            @memcpy(self.buffer[head..][0..4], len_bytes);
             return self.buffer[head + 4 .. head + 4 + len];
         }
 
@@ -132,8 +115,8 @@ pub fn FramedRing(comptime capacity: usize) type {
             const tail = self.tail.load(.unordered);
             const head = self.head.load(.acquire);
             if (tail == head) return null;
-            const len_ptr: *const u32 = @ptrCast(@alignCast(&self.buffer[tail]));
-            const len = len_ptr.*;
+            var len: u32 = 0;
+            @memcpy(std.mem.asBytes(&len), self.buffer[tail..][0..4]);
             return self.buffer[tail + 4 .. tail + 4 + len];
         }
 
@@ -153,51 +136,95 @@ pub const Arena = struct {
     pub fn init(u: Allocator, size: usize) !Arena {
         return .{ .underlying = u, .buffer = try u.alloc(u8, size) };
     }
+
     pub fn deinit(self: *Arena) void {
-        if (std.debug.runtime_safety) @memset(self.buffer, poison);
+        if (@import("builtin").mode == .Debug) {
+            @memset(self.buffer, poison);
+        }
         self.underlying.free(self.buffer);
     }
+
     pub fn reset(self: *Arena) void {
-        if (std.debug.runtime_safety) @memset(self.buffer[0..self.offset], poison);
+        if (@import("builtin").mode == .Debug) {
+            @memset(self.buffer[0..self.offset], poison);
+        }
         self.offset = 0;
     }
+
     pub fn allocator(self: *Arena) Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .free = free } };
+        return .{ .ptr = self, .vtable = &vtable };
     }
+
+    const vtable = Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .free = free,
+    };
+
     fn alloc(ctx: *anyopaque, len: usize, ptr_align: u8, _: usize) ?[*]u8 {
         const self: *Arena = @ptrCast(@alignCast(ctx));
-        const am = (@as(usize, 1) << @intCast(ptr_align)) - 1;
-        const aligned = (self.offset + am) & ~am;
+        const align_mask = (@as(usize, 1) << @intCast(ptr_align)) - 1;
+        const aligned = (self.offset + align_mask) & ~align_mask;
         if (aligned + len > self.buffer.len) return null;
-        const p = self.buffer.ptr + aligned;
+        const ptr = self.buffer.ptr + aligned;
         self.offset = aligned + len;
-        return p;
+        return ptr;
     }
-    fn resize(_: *anyopaque, _: []u8, _: u8, _: usize, _: usize) bool { return false; }
+
+    fn resize(_: *anyopaque, _: []u8, _: u8, _: usize, _: usize) bool {
+        return false;
+    }
+
     fn free(_: *anyopaque, _: []u8, _: u8, _: usize) void {}
 };
 
-test "fixed + framed" {
-    var rb = RingBuffer(u64, 32).init();
-    try std.testing.expect(rb.push(42));
-    try std.testing.expectEqual(@as(?u64, 42), rb.pop());
+test "ring basic" {
+    var rb = RingBuffer(u32, 16).init();
+    try std.testing.expect(rb.push(10));
+    try std.testing.expect(rb.push(20));
+    try std.testing.expectEqual(@as(?u32, 10), rb.pop());
+    try std.testing.expectEqual(@as(?u32, 20), rb.pop());
+    try std.testing.expect(rb.pop() == null);
+}
 
+test "ring bulk" {
+    var rb = RingBuffer(u32, 16).init();
+    const n = rb.pushSlice(&[_]u32{ 1, 2, 3, 4 });
+    try std.testing.expectEqual(@as(usize, 4), n);
+    var out: [4]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), rb.popSlice(&out));
+    try std.testing.expectEqual(@as(u32, 1), out[0]);
+    try std.testing.expectEqual(@as(u32, 4), out[3]);
+}
+
+test "framed zero-copy" {
     var fr = FramedRing(4096).init();
-    if (fr.reserve(5)) |buf| {
-        @memcpy(buf, "hello");
-        fr.commit(5);
-    } else unreachable;
-    if (fr.read()) |msg| {
-        try std.testing.expectEqualStrings("hello", msg);
-        fr.advance(msg.len);
-    } else unreachable;
+    const slice = fr.reserve(5) orelse unreachable;
+    @memcpy(slice, "hello");
+    fr.commit(5);
+    const msg = fr.read() orelse unreachable;
+    try std.testing.expectEqualStrings("hello", msg);
+    fr.advance(msg.len);
+}
+
+test "arena" {
+    var arena = try Arena.init(std.testing.allocator, 1024);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try a.alloc(u8, 64);
+    @memset(s, 0x11);
+    arena.reset();
+    const s2 = try a.alloc(u8, 32);
+    try std.testing.expect(@intFromPtr(s2.ptr) >= @intFromPtr(arena.buffer.ptr));
 }
 
 pub fn main() !void {
     const out = std.io.getStdOut().writer();
-    try out.print("spsc-ring — framed zero-copy + hybrid wait ready\n", .{});
-    var rb = RingBuffer(u64, 64).init();
-    _ = rb.pushSlice(&[_]u64{ 1, 2, 3 });
-    while (rb.pop()) |v| try out.print("{d} ", .{v});
+    try out.print("spsc-ring ready\n", .{});
+    var rb = RingBuffer(u64, 32).init();
+    _ = rb.pushSlice(&[_]u64{ 7, 8, 9 });
+    while (rb.pop()) |v| {
+        try out.print("{d} ", .{v});
+    }
     try out.print("\n", .{});
 }
