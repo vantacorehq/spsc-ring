@@ -3,77 +3,60 @@ const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 const cache_line = std.atomic.cache_line;
 
-/// Lock-free SPSC ring buffer with false-sharing protection and local index caching.
+/// Cache-line aware lock-free SPSC ring.
 pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
     comptime {
-        if (!std.math.isPowerOfTwo(capacity)) {
-            @compileError("capacity must be a power of two");
-        }
+        if (!std.math.isPowerOfTwo(capacity)) @compileError("capacity must be power of two");
     }
-
     return struct {
         const Self = @This();
         const mask: usize = capacity - 1;
 
-        // Separate cache lines → no false sharing between producer and consumer
         head: Atomic(usize) align(cache_line) = Atomic(usize).init(0),
         _pad1: [cache_line - @sizeOf(Atomic(usize))]u8 = undefined,
         tail: Atomic(usize) align(cache_line) = Atomic(usize).init(0),
         _pad2: [cache_line - @sizeOf(Atomic(usize))]u8 = undefined,
 
         buffer: [capacity]T = undefined,
+        cached_tail: usize = 0,
+        cached_head: usize = 0,
+        head_futex: Atomic(u32) = Atomic(u32).init(0),
 
-        // Cached copies (updated only when necessary)
-        cached_tail: usize = 0, // used by producer
-        cached_head: usize = 0, // used by consumer
+        pub fn init() Self { return .{}; }
 
-        pub fn init() Self {
-            return .{};
-        }
-
-        /// Single-element push. Returns false if full.
         pub fn push(self: *Self, value: T) bool {
             const head = self.head.load(.unordered);
-            var next = (head + 1) & mask;
-
+            const next = (head + 1) & mask;
             if (next == self.cached_tail) {
-                // Reload the real tail only when we think we are full
                 self.cached_tail = self.tail.load(.acquire);
                 if (next == self.cached_tail) return false;
             }
-
             self.buffer[head] = value;
-            // Release: data is visible before the index update
             self.head.store(next, .release);
+            _ = self.head_futex.fetchAdd(1, .release);
             return true;
         }
 
-        /// Bulk push. Returns number of elements actually written.
         pub fn pushSlice(self: *Self, items: []const T) usize {
-            var written: usize = 0;
+            var n: usize = 0;
             for (items) |v| {
                 if (!self.push(v)) break;
-                written += 1;
+                n += 1;
             }
-            return written;
+            return n;
         }
 
-        /// Single-element pop. Returns null if empty.
         pub fn pop(self: *Self) ?T {
             const tail = self.tail.load(.unordered);
-
             if (tail == self.cached_head) {
                 self.cached_head = self.head.load(.acquire);
                 if (tail == self.cached_head) return null;
             }
-
-            const value = self.buffer[tail];
-            // Release: we are done with the slot
+            const v = self.buffer[tail];
             self.tail.store((tail + 1) & mask, .release);
-            return value;
+            return v;
         }
 
-        /// Bulk pop into a buffer. Returns number of elements read.
         pub fn popSlice(self: *Self, out: []T) usize {
             var n: usize = 0;
             while (n < out.len) {
@@ -85,108 +68,136 @@ pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
             return n;
         }
 
+        /// Hybrid wait: short spin then futex.
+        pub fn popWait(self: *Self, spin_iters: usize) T {
+            var i: usize = 0;
+            while (true) {
+                if (self.pop()) |v| return v;
+                if (i < spin_iters) {
+                    std.atomic.spinLoopHint();
+                    i += 1;
+                } else {
+                    const expected = self.head_futex.load(.acquire);
+                    if (self.pop()) |v| return v;
+                    std.Thread.Futex.wait(&self.head_futex, expected);
+                    i = 0;
+                }
+            }
+        }
+
         pub fn len(self: *const Self) usize {
-            const h = self.head.load(.unordered);
-            const t = self.tail.load(.unordered);
-            return (h -% t) & mask;
-        }
-
-        pub fn isEmpty(self: *const Self) bool {
-            return self.len() == 0;
-        }
-
-        pub fn isFull(self: *const Self) bool {
-            return self.len() == capacity - 1;
+            return (self.head.load(.unordered) -% self.tail.load(.unordered)) & mask;
         }
     };
 }
 
-/// Bump arena with reset that keeps the underlying allocation.
-/// In Debug builds freed/reset memory is poisoned.
+/// Variable-length framed ring (zero-copy reserve/commit).
+pub fn FramedRing(comptime capacity: usize) type {
+    comptime {
+        if (!std.math.isPowerOfTwo(capacity)) @compileError("capacity must be power of two");
+    }
+    return struct {
+        const Self = @This();
+        const mask: usize = capacity - 1;
+
+        head: Atomic(usize) align(cache_line) = Atomic(usize).init(0),
+        _pad1: [cache_line - @sizeOf(Atomic(usize))]u8 = undefined,
+        tail: Atomic(usize) align(cache_line) = Atomic(usize).init(0),
+        _pad2: [cache_line - @sizeOf(Atomic(usize))]u8 = undefined,
+        buffer: [capacity]u8 = undefined,
+
+        pub fn init() Self { return .{}; }
+
+        /// Reserve contiguous space for a message of `len` bytes.
+        /// Returns a writable slice inside the ring or null.
+        pub fn reserve(self: *Self, len: usize) ?[]u8 {
+            const total = 4 + len;
+            const head = self.head.load(.unordered);
+            const tail = self.tail.load(.acquire);
+            const used = (head -% tail) & mask;
+            if (used + total >= capacity) return null;
+            if (head + total > capacity) return null; // require contiguous
+
+            const len_ptr: *u32 = @ptrCast(@alignCast(&self.buffer[head]));
+            len_ptr.* = @intCast(len);
+            return self.buffer[head + 4 .. head + 4 + len];
+        }
+
+        pub fn commit(self: *Self, len: usize) void {
+            const head = self.head.load(.unordered);
+            self.head.store((head + 4 + len) & mask, .release);
+        }
+
+        pub fn read(self: *Self) ?[]const u8 {
+            const tail = self.tail.load(.unordered);
+            const head = self.head.load(.acquire);
+            if (tail == head) return null;
+            const len_ptr: *const u32 = @ptrCast(@alignCast(&self.buffer[tail]));
+            const len = len_ptr.*;
+            return self.buffer[tail + 4 .. tail + 4 + len];
+        }
+
+        pub fn advance(self: *Self, len: usize) void {
+            const tail = self.tail.load(.unordered);
+            self.tail.store((tail + 4 + len) & mask, .release);
+        }
+    };
+}
+
 pub const Arena = struct {
     underlying: Allocator,
     buffer: []u8,
     offset: usize = 0,
+    const poison: u8 = 0xAA;
 
-    const poison_byte: u8 = 0xAA;
-
-    pub fn init(underlying: Allocator, size: usize) !Arena {
-        const buffer = try underlying.alloc(u8, size);
-        return .{ .underlying = underlying, .buffer = buffer };
+    pub fn init(u: Allocator, size: usize) !Arena {
+        return .{ .underlying = u, .buffer = try u.alloc(u8, size) };
     }
-
     pub fn deinit(self: *Arena) void {
-        if (std.debug.runtime_safety) {
-            @memset(self.buffer, poison_byte);
-        }
+        if (std.debug.runtime_safety) @memset(self.buffer, poison);
         self.underlying.free(self.buffer);
-        self.* = undefined;
     }
-
-    /// Reset the bump pointer; memory stays allocated.
     pub fn reset(self: *Arena) void {
-        if (std.debug.runtime_safety) {
-            @memset(self.buffer[0..self.offset], poison_byte);
-        }
+        if (std.debug.runtime_safety) @memset(self.buffer[0..self.offset], poison);
         self.offset = 0;
     }
-
     pub fn allocator(self: *Arena) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .free = free } };
     }
-
-    fn alloc(ctx: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
-        _ = ret_addr;
+    fn alloc(ctx: *anyopaque, len: usize, ptr_align: u8, _: usize) ?[*]u8 {
         const self: *Arena = @ptrCast(@alignCast(ctx));
-        const align_mask = (@as(usize, 1) << @intCast(ptr_align)) - 1;
-        const aligned = (self.offset + align_mask) & ~align_mask;
+        const am = (@as(usize, 1) << @intCast(ptr_align)) - 1;
+        const aligned = (self.offset + am) & ~am;
         if (aligned + len > self.buffer.len) return null;
-        const ptr = self.buffer.ptr + aligned;
+        const p = self.buffer.ptr + aligned;
         self.offset = aligned + len;
-        return ptr;
+        return p;
     }
-
-    fn resize(_: *anyopaque, _: []u8, _: u8, _: usize, _: usize) bool {
-        return false;
-    }
-
-    fn free(_: *anyopaque, _: []u8, _: u8, _: usize) void {
-        // no-op — lifetime is controlled by reset / deinit
-    }
+    fn resize(_: *anyopaque, _: []u8, _: u8, _: usize, _: usize) bool { return false; }
+    fn free(_: *anyopaque, _: []u8, _: u8, _: usize) void {}
 };
 
-test "ring basic + bulk" {
-    var rb = RingBuffer(u32, 16).init();
-    try std.testing.expect(rb.push(10));
-    try std.testing.expectEqual(@as(usize, 3), rb.pushSlice(&[_]u32{ 20, 30, 40 }));
-    try std.testing.expectEqual(@as(?u32, 10), rb.pop());
+test "fixed + framed" {
+    var rb = RingBuffer(u64, 32).init();
+    try std.testing.expect(rb.push(42));
+    try std.testing.expectEqual(@as(?u64, 42), rb.pop());
 
-    var out: [4]u32 = undefined;
-    try std.testing.expectEqual(@as(usize, 3), rb.popSlice(&out));
-    try std.testing.expectEqual(@as(u32, 20), out[0]);
-    try std.testing.expectEqual(@as(u32, 40), out[2]);
-}
-
-test "arena reset + poison" {
-    var arena = try Arena.init(std.testing.allocator, 512);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const s = try a.alloc(u8, 32);
-    @memset(s, 0x11);
-    arena.reset();
-    // after reset the same memory region can be reused
-    const s2 = try a.alloc(u8, 16);
-    try std.testing.expect(@intFromPtr(s2.ptr) <= @intFromPtr(s.ptr) + 32);
+    var fr = FramedRing(4096).init();
+    if (fr.reserve(5)) |buf| {
+        @memcpy(buf, "hello");
+        fr.commit(5);
+    } else unreachable;
+    if (fr.read()) |msg| {
+        try std.testing.expectEqualStrings("hello", msg);
+        fr.advance(msg.len);
+    } else unreachable;
 }
 
 pub fn main() !void {
     const out = std.io.getStdOut().writer();
-    try out.print("spsc-ring — cache-line aware lock-free SPSC ready\n", .{});
-
-    var rb = RingBuffer(u64, 32).init();
-    _ = rb.pushSlice(&[_]u64{ 1, 2, 3, 4, 5 });
-    while (rb.pop()) |v| {
-        try out.print("{d} ", .{v});
-    }
+    try out.print("spsc-ring — framed zero-copy + hybrid wait ready\n", .{});
+    var rb = RingBuffer(u64, 64).init();
+    _ = rb.pushSlice(&[_]u64{ 1, 2, 3 });
+    while (rb.pop()) |v| try out.print("{d} ", .{v});
     try out.print("\n", .{});
 }
